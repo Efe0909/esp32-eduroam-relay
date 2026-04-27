@@ -1,6 +1,11 @@
 /* ── Feature flags ────────────────────────────────────────────────────── */
-#define USE_ENTERPRISE   /* Use WPA2-Enterprise (eduroam). Undef for plain PSK */
-#define USE_MAC_FILTER   /* Enforce MAC whitelist on AP */
+/* Uncomment USE_ENTERPRISE to connect upstream via WPA2-Enterprise (eduroam).
+ * Leave commented to use a plain WPA2-PSK hotspot for testing. */
+#define USE_ENTERPRISE
+
+/* Uncomment USE_MAC_FILTER to enforce a MAC address whitelist on the AP.
+ * Any device not in ALLOWED_MACS will be deauthenticated immediately. */
+#define USE_MAC_FILTER
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -21,32 +26,49 @@
 #include "lwip/stats.h"
 
 /* ── Upstream: plain PSK fallback (USE_ENTERPRISE not defined) ────────── */
+/* Used only when USE_ENTERPRISE is commented out — handy for local testing
+ * with a regular WPA2 hotspot before deploying to eduroam. */
 #ifndef USE_ENTERPRISE
-#define STA_SSID     "Kadir Efe iPhone\xe2\x80\x99u"
-#define STA_PASSWORD "ried3154"
+#define STA_SSID     "YOUR_HOTSPOT_SSID"
+#define STA_PASSWORD "YOUR_HOTSPOT_PASSWORD"
 #endif
 
 /* ── Private AP ───────────────────────────────────────────────────────── */
+/* The AP that clients (e.g. your printer) connect to.
+ * AP_HIDDEN=1 hides the SSID from scans; toggle at runtime with `ssid show`. */
 #define AP_SSID     "BambuBridge"
-#define AP_PASSWORD "bambu2024!"
+#define AP_PASSWORD "YOUR_AP_PASSWORD"
 #define AP_CHANNEL  6
-#define AP_HIDDEN   1 // change to 0 to broadcast SSID
+#define AP_HIDDEN   1
 #define AP_MAX_CONN 4
 
+/* Maximum STA reconnect attempts before giving up and logging an error.
+ * The AP stays up even if upstream fails, so clients can still join the AP;
+ * they just won't have internet until the STA reconnects. */
 #define MAX_RETRY    10
-#define DNS_UPSTREAM "8.8.8.8" // change if you want to use a different DNS server
 
-/* ── NVS ──────────────────────────────────────────────────────────────── */
+/* DNS upstream — all queries from AP clients are proxied here.
+ * Using 8.8.8.8 because advertising the eduroam gateway as DNS
+ * via DHCP was unreliable; a dedicated UDP forwarder task is more robust. */
+#define DNS_UPSTREAM "8.8.8.8"
+
+/* ── NVS credential storage ───────────────────────────────────────────── */
+/* EAP credentials are stored in NVS (non-volatile storage) rather than
+ * compiled into the binary. On first boot with no credentials, the firmware
+ * drops to a serial REPL so you can provision them with `provision <id> <user> <pass>`. */
 #define NVS_NS    "relay"
 #define NVS_IDENT "identity"
 #define NVS_USER  "username"
 #define NVS_PASS  "password"
 
 /* ── MAC whitelist ────────────────────────────────────────────────────── */
+/* Add one entry per device you want to allow on the AP.
+ * Devices not listed here are deauthenticated on connect.
+ * Find a device's MAC by running `status` after it connects and gets blocked. */
 #ifdef USE_MAC_FILTER
 static const uint8_t ALLOWED_MACS[][6] = {
-    { 0x3c, 0x1a, 0xcc, 0xdc, 0xe7, 0xbc },  /* Bambu P2S */
-    { 0xf8, 0x2a, 0xe2, 0x05, 0x80, 0x36 },  /* Efe iPhone */
+    { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 },  /* your printer */
+    { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02 },  /* your phone   */
 };
 static const int ALLOWED_COUNT = sizeof(ALLOWED_MACS) / 6;
 #endif
@@ -89,6 +111,9 @@ static void creds_save(const char *ident, const char *user, const char *pass)
 #endif /* USE_ENTERPRISE */
 
 /* ── DNS forwarder ────────────────────────────────────────────────────── */
+/* Logs the queried domain name from a raw DNS packet.
+ * DNS question section starts at byte 12; each label is a length-prefixed string.
+ * Pointers (0xC0 prefix) are compression; we stop there since we only need the name. */
 static bool s_dns_log = false;
 
 static void dns_log_query(const uint8_t *buf, int n)
@@ -106,6 +131,9 @@ static void dns_log_query(const uint8_t *buf, int n)
     if (ni) ESP_LOGI("dns", "%s", name);
 }
 
+/* UDP DNS proxy: receives queries from AP clients on port 53, forwards them
+ * to DNS_UPSTREAM, and relays the response back.
+ * Opens a new ephemeral socket per query to avoid state management. */
 static void dns_forwarder_task(void *arg)
 {
     uint8_t buf[512];
@@ -139,6 +167,9 @@ static void dns_forwarder_task(void *arg)
 }
 
 /* ── Bandwidth monitor task ───────────────────────────────────────────── */
+/* Polls lwIP IP packet counters once per second and estimates throughput.
+ * Uses a fixed 1400-byte average packet size — rough, but good enough for
+ * a sanity check. Requires CONFIG_LWIP_STATS=y in sdkconfig. */
 static void monitor_task(void *arg)
 {
     uint32_t prev_rx = 0, prev_tx = 0;
@@ -234,8 +265,8 @@ static int cmd_provision(int argc, char **argv)
 {
     if (argc != 4) {
         printf("Usage: provision <identity> <username> <password>\n");
-        printf("  identity : outer EAP identity  (e.g. anonymous@ozu.edu.tr)\n");
-        printf("  username : inner EAP identity  (e.g. user@ozu.edu.tr)\n");
+        printf("  identity : outer EAP identity  (e.g. anonymous@university.edu)\n");
+        printf("  username : inner EAP identity  (e.g. user@university.edu)\n");
         printf("  password : EAP password\n");
         return 1;
     }
@@ -282,16 +313,16 @@ static void console_init(void)
     esp_console_register_help_command();
 
     const esp_console_cmd_t cmds[] = {
-        { "status",    "WiFi status and client list",          NULL, cmd_status    },
-        { "ssid",      "ssid <show|hide>  toggle AP broadcast", NULL, cmd_ssid     },
-        { "monitor",   "monitor <on|off>  bandwidth estimate", NULL, cmd_monitor   },
-        { "dnslog",    "dnslog <on|off>  log DNS queries",     NULL, cmd_dnslog    },
-        { "reconnect", "Reconnect upstream WiFi",              NULL, cmd_reconnect },
-        { "restart",   "Restart ESP32",                        NULL, cmd_restart   },
+        { "status",    "WiFi status and client list",           NULL, cmd_status    },
+        { "ssid",      "ssid <show|hide>  toggle AP broadcast", NULL, cmd_ssid      },
+        { "monitor",   "monitor <on|off>  bandwidth estimate",  NULL, cmd_monitor   },
+        { "dnslog",    "dnslog <on|off>  log DNS queries",      NULL, cmd_dnslog    },
+        { "reconnect", "Reconnect upstream WiFi",               NULL, cmd_reconnect },
+        { "restart",   "Restart ESP32",                         NULL, cmd_restart   },
 #ifdef USE_ENTERPRISE
-        { "provision",    "provision <identity> <user> <pass>  Store EAP creds in NVS", NULL, cmd_provision    },
-        { "clear_creds",  "Wipe stored EAP credentials",                                NULL, cmd_clear_creds  },
-        { "whoami",       "Show stored identity/username",                              NULL, cmd_whoami       },
+        { "provision",   "provision <identity> <user> <pass>  Store EAP creds in NVS", NULL, cmd_provision   },
+        { "clear_creds", "Wipe stored EAP credentials",                                NULL, cmd_clear_creds },
+        { "whoami",      "Show stored identity/username",                              NULL, cmd_whoami      },
 #endif
     };
     for (int i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++)
@@ -309,6 +340,7 @@ static void event_handler(void *arg, esp_event_base_t base,
         case WIFI_EVENT_STA_START:
             esp_wifi_connect();
             break;
+
         case WIFI_EVENT_STA_DISCONNECTED:
             if (s_retries < MAX_RETRY) {
                 esp_wifi_connect();
@@ -318,11 +350,13 @@ static void event_handler(void *arg, esp_event_base_t base,
                 ESP_LOGE(TAG, "Gave up connecting to upstream WiFi");
             }
             break;
+
         case WIFI_EVENT_AP_STACONNECTED: {
             wifi_event_ap_staconnected_t *e = data;
             ESP_LOGI(TAG, "Client joined - %02x:%02x:%02x:%02x:%02x:%02x AID:%d",
                      e->mac[0],e->mac[1],e->mac[2],e->mac[3],e->mac[4],e->mac[5], e->aid);
 #ifdef USE_MAC_FILTER
+            /* Walk the whitelist; return immediately if the MAC is allowed. */
             for (int i = 0; i < ALLOWED_COUNT; i++)
                 if (memcmp(e->mac, ALLOWED_MACS[i], 6) == 0) return;
             ESP_LOGW(TAG, "Blocked  - %02x:%02x:%02x:%02x:%02x:%02x",
@@ -331,6 +365,7 @@ static void event_handler(void *arg, esp_event_base_t base,
 #endif
             break;
         }
+
         case WIFI_EVENT_AP_STADISCONNECTED: {
             wifi_event_ap_stadisconnected_t *e = data;
             ESP_LOGI(TAG, "Client left  - %02x:%02x:%02x:%02x:%02x:%02x",
@@ -349,6 +384,7 @@ static void event_handler(void *arg, esp_event_base_t base,
 /* ── Entry point ──────────────────────────────────────────────────────── */
 void app_main(void)
 {
+    /* NVS must be initialised before anything else — WiFi and console both use it. */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -363,7 +399,9 @@ void app_main(void)
     g_sta_netif = esp_netif_create_default_wifi_sta();
 
 #ifdef USE_ENTERPRISE
-    /* Load credentials from NVS */
+    /* Try to load EAP credentials from NVS.
+     * If none are stored (first boot, or after clear_creds), drop to the REPL
+     * so the user can provision them over serial before the relay starts. */
     char ident[64] = {0}, user[64] = {0}, pass[64] = {0};
     bool provisioned = creds_load(ident, sizeof(ident),
                                   user,  sizeof(user),
@@ -372,7 +410,7 @@ void app_main(void)
         ESP_LOGW(TAG, "Not provisioned. Connect via serial and run:");
         ESP_LOGW(TAG, "  provision <identity> <username> <password>");
         console_init();
-        return; /* console_init() blocks in the REPL */
+        return;
     }
 #endif
 
@@ -385,6 +423,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
+    /* Configure the private AP. */
     wifi_config_t ap_cfg = {
         .ap = {
             .ssid           = AP_SSID,
@@ -398,6 +437,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
 
 #ifdef USE_ENTERPRISE
+    /* Configure the STA for WPA2-Enterprise (PEAP/MSCHAPv2).
+     * disable_time_check skips certificate expiry validation — useful when
+     * the university cert chain is self-signed or your device clock is off. */
     wifi_config_t sta_cfg = { .sta = { .ssid = "eduroam" } };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_eap_client_set_identity((uint8_t *)ident, strlen(ident)));
@@ -405,7 +447,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_eap_client_set_password((uint8_t *)pass,  strlen(pass)));
     esp_eap_client_set_disable_time_check(true);
     ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
-    /* Zero credential buffers — EAP stack has its own copy now */
+    /* Zero buffers — the EAP stack has copied the credentials internally. */
     memset(ident, 0, sizeof(ident));
     memset(user,  0, sizeof(user));
     memset(pass,  0, sizeof(pass));
@@ -417,14 +459,17 @@ void app_main(void)
 #endif
 
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "AP up: BambuBridge (hidden, WPA2)");
-    ESP_LOGI(TAG, "Connecting to eduroam...");
+    ESP_LOGI(TAG, "AP up: %s (WPA2)", AP_SSID);
+    ESP_LOGI(TAG, "Connecting to upstream...");
 
+    /* Block until the STA connects or exhausts retries. */
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_eg, STA_CONNECTED_BIT | STA_FAIL_BIT,
         pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & STA_CONNECTED_BIT) {
+        /* Enable NAPT on the AP interface so traffic from 192.168.4.x is
+         * masqueraded through the STA's upstream IP. */
         esp_netif_ip_info_t ap_ip;
         esp_netif_get_ip_info(g_ap_netif, &ap_ip);
         ip_napt_enable(ap_ip.ip.addr, 1);
