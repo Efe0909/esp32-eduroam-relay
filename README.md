@@ -65,7 +65,7 @@ alias get_idf='source ~/esp/esp-idf/export.sh'
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/your-username/esp32-eduroam-relay.git
+git clone https://github.com/Efe0909/esp32-eduroam-relay.git
 cd esp32-eduroam-relay
 ```
 
